@@ -75,6 +75,7 @@ import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.MultivaluedMap;
 import jakarta.ws.rs.core.Response;
 import jakarta.ws.rs.core.StreamingOutput;
+import prerna.auth.AuthProvider;
 import prerna.auth.User;
 import prerna.auth.utils.SecurityEngineUtils;
 import prerna.auth.utils.SecurityInsightUtils;
@@ -1255,21 +1256,78 @@ public class NameServer {
 		return WebUtility.getResponseNoCache(dataReturn, 200);
 	}
 
+	/**
+	 * Drain a pixel job's buffered console output.
+	 *
+	 * <p>
+	 * Job ids are opaque, but they were the <em>only</em> thing protecting this
+	 * endpoint: any caller presenting a job id got that job's status and its whole
+	 * console buffer, which is the executing pixel's output. The author had sketched
+	 * a session check and left it commented out, and the sibling
+	 * {@link #agentRunStreaming(MultivaluedMap, HttpServletRequest)} carries a real
+	 * one — so this reads as an oversight rather than a decision.
+	 *
+	 * <p>
+	 * A job knows its owner through the {@link Insight} it runs under, so the check
+	 * is exact rather than merely "some authenticated user": another user's job id
+	 * now behaves like an unknown job, which is the same answer they would get for a
+	 * job id that never existed and leaks nothing about which ids are real.
+	 */
 	@POST
 	@Path("/pixelJobStreaming")
 	@Produces("application/json")
 	public Response pixelJobStreaming(MultivaluedMap<String, String> form, @Context HttpServletRequest request) {
 		String jobId = WebUtility.inputSQLSanitizer(form.getFirst("jobId"));
-		// HttpSession session = request.getSession(true);
-		// if(session.getAttribute(jobId) != null) {
-		// if(jobId != null)
+
+		HttpSession session = request.getSession(false);
+		User user = session == null ? null : (User) session.getAttribute(Constants.SESSION_USER);
+		if (user == null) {
+			Map<String, Object> errorRet = new HashMap<>();
+			errorRet.put("errorMessage", "Pixel job streaming requires a user session");
+			return WebUtility.getResponseNoCache(errorRet, 401);
+		}
+
 		PixelJobRunner jobRunner = PixelJobManager.getManager().getJob(jobId);
-		List<Map<String, Object>> console = PixelJobManager.getManager().getStreamOut(jobId);
+		if (jobRunner != null && !isJobOwnedBy(jobRunner, user)) {
+			jobRunner = null;
+		}
+
+		List<Map<String, Object>> console = jobRunner == null ? new ArrayList<>()
+				: PixelJobManager.getManager().getStreamOut(jobId);
 		Map<String, Object> dataReturn = new HashMap<>();
 		dataReturn.put("status", jobRunner == null ? PixelJobStatus.UNKNOWN_JOB.getValue() : jobRunner.getStatus());
 		dataReturn.put("message", console);
-		// }
 		return WebUtility.getResponseNoCache(dataReturn, 200);
+	}
+
+	/**
+	 * Whether {@code caller} is the user the job runs as.
+	 *
+	 * <p>
+	 * Compared on the user's own id rather than object identity, since the session
+	 * user and the insight's user are separate instances. A job whose insight or user
+	 * cannot be read is treated as not owned — failing closed, because the
+	 * alternative hands the console to whoever asked.
+	 */
+	private static boolean isJobOwnedBy(PixelJobRunner jobRunner, User caller) {
+		try {
+			Insight jobInsight = jobRunner.getInsight();
+			User owner = jobInsight == null ? null : jobInsight.getUser();
+			if (owner == null) {
+				return false;
+			}
+			AuthProvider callerProvider = caller.getPrimaryLogin();
+			AuthProvider ownerProvider = owner.getPrimaryLogin();
+			if (callerProvider == null || ownerProvider == null) {
+				return false;
+			}
+			String callerId = caller.getAccessToken(callerProvider).getId();
+			String ownerId = owner.getAccessToken(ownerProvider).getId();
+			return callerId != null && callerId.equals(ownerId);
+		} catch (Exception e) {
+			classLogger.warn("Could not determine the owner of pixel job; treating it as not owned by the caller", e);
+			return false;
+		}
 	}
 
 	/**
