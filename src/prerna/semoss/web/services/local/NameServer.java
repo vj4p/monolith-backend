@@ -37,6 +37,10 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 
 import org.apache.commons.io.FilenameUtils;
 import org.apache.http.HttpEntity;
@@ -64,6 +68,7 @@ import jakarta.servlet.http.Cookie;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpSession;
 import jakarta.ws.rs.Consumes;
+import jakarta.ws.rs.DefaultValue;
 import jakarta.ws.rs.GET;
 import jakarta.ws.rs.POST;
 import jakarta.ws.rs.Path;
@@ -75,6 +80,8 @@ import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.MultivaluedMap;
 import jakarta.ws.rs.core.Response;
 import jakarta.ws.rs.core.StreamingOutput;
+import jakarta.ws.rs.sse.Sse;
+import jakarta.ws.rs.sse.SseEventSink;
 import prerna.auth.AuthProvider;
 import prerna.auth.User;
 import prerna.auth.utils.SecurityEngineUtils;
@@ -89,6 +96,7 @@ import prerna.reactor.ReactorFactory;
 import prerna.reactor.agent.mcp.MCPErrorCode;
 import prerna.reactor.agent.mcp.MCPUtility;
 import prerna.reactor.agent.run.AgentRunService;
+import prerna.reactor.agent.run.AgentRunStatus;
 import prerna.reactor.agent.stream.AgentRunStreamService;
 import prerna.sablecc2.PixelRunner;
 import prerna.sablecc2.PixelStreamUtility;
@@ -114,6 +122,25 @@ public class NameServer {
 	private static final String ERROR_TYPE = "errorType";
 	private static final String INSIGHT_NOT_FOUND = "INSIGHT_NOT_FOUND";
 	private static final String EXPRESSION_NOT_FOUND = "EXPRESSION_NOT_FOUND";
+
+	/**
+	 * Backs {@link #agentRunStreamingSse}. Mirrors {@code A2AResource}'s
+	 * SSE_EXECUTOR: one connection ties up a thread for the run's whole
+	 * lifetime (it blocks on {@link java.util.concurrent.BlockingQueue#poll}),
+	 * so this must never be the servlet container's own request-handling
+	 * pool, or enough concurrent streams would starve ordinary HTTP traffic.
+	 */
+	private static final ExecutorService AGENT_SSE_EXECUTOR;
+	static {
+		ThreadPoolExecutor executor = new ThreadPoolExecutor(10, 200, 60L, TimeUnit.SECONDS,
+				new LinkedBlockingQueue<>(), r -> {
+					Thread t = new Thread(r, "agent-run-sse-worker");
+					t.setDaemon(true);
+					return t;
+				});
+		executor.allowCoreThreadTimeOut(true);
+		AGENT_SSE_EXECUTOR = executor;
+	}
 
 	////////////////////////////////////////////////////////////////////////////////
 
@@ -1373,6 +1400,176 @@ public class NameServer {
 			errorRet.put("errorMessage", "No agent run found for runId=" + runId);
 			return WebUtility.getResponseNoCache(errorRet, 404);
 		}
+	}
+
+	/**
+	 * Push-based twin of {@link #agentRunStreaming(MultivaluedMap, HttpServletRequest)}.
+	 *
+	 * <p>
+	 * The poll endpoint above remains the source of truth and the fallback: this
+	 * is purely additive. It opens a long-lived SSE connection and forwards each
+	 * canonical item event the run emits as it happens, replaying from
+	 * {@code lastEventSequence} first so a reconnecting client (one that dropped
+	 * its connection, or that started on the poll path and is upgrading) sees
+	 * nothing twice and loses nothing in between.
+	 *
+	 * <p>
+	 * Authorization is identical to the poll endpoint: the session user is used
+	 * to construct the {@link Insight} that scopes {@code getRunSnapshot}, so
+	 * another user's runId resolves to a 404, not someone else's run.
+	 *
+	 * <h3>Node affinity</h3>
+	 * {@link AgentRunStreamService} is in-process. Exactly like
+	 * {@code agentRunStreaming}'s drain and the rest of this run's durable
+	 * state, this only sees events if the connection lands on the node actually
+	 * executing the run -- which is guaranteed only when the load balancer's
+	 * sticky-session cookie is honored, same requirement the poll endpoint has
+	 * always had. A client on the wrong node gets an immediate run snapshot and
+	 * then silence until the run goes terminal or it disconnects; callers
+	 * should keep the poll endpoint as a fallback rather than depend on SSE
+	 * delivering every event.
+	 *
+	 * @param runId - the run to stream.
+	 * @param lastEventSequence - replay only events after this sequence number;
+	 *                          0 (default) replays everything still buffered.
+	 */
+	@GET
+	@Path("/agentRunStreamingSse")
+	@Produces(MediaType.SERVER_SENT_EVENTS)
+	public void agentRunStreamingSse(@QueryParam("runId") String runId,
+			@QueryParam("lastEventSequence") @DefaultValue("0") long lastEventSequence,
+			@Context SseEventSink eventSink, @Context Sse sse, @Context HttpServletRequest request) {
+		String cleanRunId = WebUtility.inputSQLSanitizer(runId);
+		HttpSession session = request.getSession(false);
+		User user = session == null ? null : (User) session.getAttribute(Constants.SESSION_USER);
+		// Named "error" would collide with EventSource's own native error event
+		// (dispatched client-side on transport failure, not something the server
+		// can send) -- both arrive through the browser's addEventListener("error",
+		// ...). "stream-error" keeps this a distinguishable, application-level
+		// signal the client can tell apart from a dropped connection.
+		AGENT_SSE_EXECUTOR.submit(() -> {
+			try {
+				if (cleanRunId == null || cleanRunId.trim().isEmpty()) {
+					sendAgentSse(eventSink, sse, "stream-error", errorPayload("runId is required"));
+					return;
+				}
+				if (user == null || user.isAnonymous()) {
+					sendAgentSse(eventSink, sse, "stream-error",
+							errorPayload("Agent run streaming requires an authenticated user"));
+					return;
+				}
+				Insight authInsight = new Insight();
+				authInsight.setUser(user);
+				streamAgentRun(cleanRunId.trim(), lastEventSequence, eventSink, sse, authInsight);
+			} catch (SecurityException e) {
+				sendAgentSse(eventSink, sse, "stream-error",
+						errorPayload("Agent run streaming requires an authenticated user"));
+			} catch (IllegalArgumentException e) {
+				sendAgentSse(eventSink, sse, "stream-error", errorPayload("No agent run found for runId=" + runId));
+			} catch (Exception e) {
+				classLogger.warn("agentRunStreamingSse failed for runId={}: {}", cleanRunId, e.getMessage(), e);
+				sendAgentSse(eventSink, sse, "stream-error", errorPayload(e.getMessage()));
+			} finally {
+				ThreadStore.remove();
+				if (eventSink != null && !eventSink.isClosed()) {
+					try {
+						eventSink.close();
+					} catch (IOException e) {
+						classLogger.error("Unable to close agent run SSE event sink", e);
+					}
+				}
+			}
+		});
+	}
+
+	/**
+	 * Sends the run's current snapshot, subscribes to its live stream (which
+	 * replays everything buffered after {@code lastEventSequence} before any new
+	 * event), and relays both snapshot and events as SSE frames until the run
+	 * pauses for input, reaches a terminal status, or the client disconnects.
+	 */
+	private void streamAgentRun(String runId, long lastEventSequence, SseEventSink eventSink, Sse sse,
+			Insight insight) throws InterruptedException {
+		Map<String, Object> runSnapshot = AgentRunService.get().getRunSnapshot(runId, insight);
+		sendAgentSse(eventSink, sse, "run", runSnapshot);
+		if (isPausedOrTerminalRunStatus(String.valueOf(runSnapshot.get("status")))) {
+			return;
+		}
+
+		// Bridges AgentRunStreamService's push callback (invoked on its own
+		// dispatch thread) back onto this thread, which owns the blocking
+		// eventSink.send calls -- the same shape A2AResource.streamRun's
+		// predecessor used for AgentRunEventBus, before that was replaced by DB
+		// polling.
+		LinkedBlockingQueue<Map<String, Object>> queue = new LinkedBlockingQueue<>();
+		AgentRunStreamService.Subscription subscription = AgentRunStreamService.get().subscribe(runId,
+				lastEventSequence, queue::offer);
+		if (subscription == null) {
+			// No stream session (e.g. a non-canonical harness, or one already swept
+			// away): the one-shot snapshot above is all there is to send.
+			return;
+		}
+		try {
+			while (eventSink != null && !eventSink.isClosed()) {
+				Map<String, Object> event = queue.poll(10, TimeUnit.SECONDS);
+				boolean checkStatus = event == null;
+				if (event != null) {
+					sendAgentSse(eventSink, sse, "event", event);
+					// item.completed is the one event type that can coincide with a
+					// status change (run finished, or paused on a tool); other event
+					// types (deltas, tool started/updated) cannot, so skip the DB
+					// round-trip for those -- a chatty run can emit many deltas per
+					// second and this loop would otherwise query status that often.
+					checkStatus = "item.completed".equals(event.get("type"));
+				}
+				if (!checkStatus) {
+					continue;
+				}
+				// The timeout-without-an-event branch exists so a run that goes
+				// quiet with no further events (e.g. INPUT_REQUIRED from a tool
+				// whose own item never completes, or the worker thread dying) is
+				// still noticed within one poll interval, instead of hanging until
+				// the client gives up.
+				Map<String, Object> refreshed = AgentRunService.get().getRunSnapshot(runId, insight);
+				if (isPausedOrTerminalRunStatus(String.valueOf(refreshed.get("status")))) {
+					sendAgentSse(eventSink, sse, "run", refreshed);
+					return;
+				}
+			}
+		} finally {
+			subscription.close();
+		}
+	}
+
+	/**
+	 * Whether this status ends the SSE loop. Mirrors the poll loop's own
+	 * boundary ({@code isTerminalStatus} in {@code AgentRunService}, which
+	 * folds INPUT_REQUIRED in alongside the three true terminal statuses for
+	 * exactly this reason): INPUT_REQUIRED is a synchronous wait point for the
+	 * caller, not a run outcome, but the stream still has nothing further to
+	 * push until the paused tool is decided and the run goes back to RUNNING.
+	 */
+	private static boolean isPausedOrTerminalRunStatus(String status) {
+		return isTerminalRunStatus(status) || AgentRunStatus.INPUT_REQUIRED.name().equals(status);
+	}
+
+	private static boolean isTerminalRunStatus(String status) {
+		return AgentRunStatus.COMPLETED.name().equals(status) || AgentRunStatus.FAILED.name().equals(status)
+				|| AgentRunStatus.CANCELLED.name().equals(status);
+	}
+
+	private static Map<String, Object> errorPayload(String message) {
+		Map<String, Object> error = new HashMap<>();
+		error.put("errorMessage", message);
+		return error;
+	}
+
+	private static void sendAgentSse(SseEventSink eventSink, Sse sse, String eventName, Object data) {
+		if (eventSink == null || eventSink.isClosed()) {
+			return;
+		}
+		eventSink.send(sse.newEventBuilder().name(eventName).mediaType(MediaType.APPLICATION_JSON_TYPE)
+				.data(String.class, GsonUtility.getDefaultGson().toJson(data)).build());
 	}
 
 	/**
