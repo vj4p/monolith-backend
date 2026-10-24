@@ -47,6 +47,7 @@ import prerna.auth.SyncUserAssetsThread;
 import prerna.auth.User;
 import prerna.cluster.util.ClusterUtil;
 import prerna.engine.impl.model.Room;
+import prerna.engine.impl.model.RoomMessageStore;
 import prerna.engine.impl.model.RoomUtils;
 import prerna.engine.impl.r.IRUserConnection;
 import prerna.om.ClientProcessWrapper;
@@ -55,6 +56,7 @@ import prerna.om.InsightStore;
 import prerna.om.LocalUserStore;
 import prerna.reactor.playwright.PlaywrightSession;
 import prerna.semoss.web.services.local.MCPResource;
+import prerna.usertracking.UserAuditTrailUtils;
 import prerna.usertracking.UserTrackingUtils;
 import prerna.util.Constants;
 import prerna.util.FileSystemUtil;
@@ -66,6 +68,7 @@ import prerna.util.insight.InsightUtility;
 public class UserSessionLoader implements HttpSessionListener {
 
 	public static final String IS_USER_LOGOUT = "IS_USER_LOGOUT";
+	public static final String USER_LOGOUT_IP_ADDR = "USER_LOGOUT_IP_ADDR";
 
 	private static final Logger classLogger = LogManager.getLogger(UserSessionLoader.class);
 	private static final String DIR_SEPARATOR = java.nio.file.FileSystems.getDefault().getSeparator();
@@ -210,10 +213,23 @@ public class UserSessionLoader implements HttpSessionListener {
 			cleanupUserRooms(subAgent, "agent user");
 		}
 
+		// drop cached room projections from Redis; they reload from the DB on next open
+		evictRedisRooms(thisUser);
+		if (subAgent != thisUser) {
+			evictRedisRooms(subAgent);
+		}
+
 		cleanupPlaywrightSessions(thisUser);
 
 		// register the successful logout
 		UserTrackingUtils.registerLogout(sessionId);
+		if (thisUser != null) {
+			String logoutIpAddr = (String) session.getAttribute(UserSessionLoader.USER_LOGOUT_IP_ADDR);
+			UserAuditTrailUtils.recordLogout(thisUser, sessionId,
+					Boolean.parseBoolean(session.getAttribute(UserSessionLoader.IS_USER_LOGOUT) + "") ? "USER_LOGOUT"
+							: "SESSION_ENDED",
+					logoutIpAddr);
+		}
 		classLogger.info("Finished logout");
 	}
 
@@ -268,6 +284,17 @@ public class UserSessionLoader implements HttpSessionListener {
 	 * @param user     the user whose room map should be processed
 	 * @param userType descriptive label used in logs (for example, session user)
 	 */
+	private void evictRedisRooms(User user) {
+		if (user == null || user.getRoomHash() == null) {
+			return;
+		}
+		try {
+			RoomMessageStore.evictRedisProjections(user.getRoomHash().keySet());
+		} catch (Exception e) {
+			classLogger.warn("Failed to evict Redis room projections during session cleanup", e);
+		}
+	}
+
 	private void cleanupUserRooms(User user, String userType) {
 		if (!ClusterUtil.IS_CLUSTER || user == null || user.getRoomHash() == null) {
 			return;
