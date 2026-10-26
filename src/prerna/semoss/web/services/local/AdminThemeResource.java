@@ -44,6 +44,9 @@ import jakarta.ws.rs.core.Response;
 import prerna.auth.User;
 import prerna.theme.AbstractThemeUtils;
 import prerna.theme.AdminThemeUtils;
+import prerna.usertracking.AuditEventType;
+import prerna.usertracking.AuditTargetType;
+import prerna.usertracking.UserAuditTrailUtils;
 import prerna.web.services.util.WebUtility;
 
 @Path("/themes")
@@ -99,7 +102,9 @@ public class AdminThemeResource {
 			errorMap.put("error", "User is not an admin");
 			return WebUtility.getResponse(errorMap, 401);
 		}
-		List<Map<String, Object>> themes = instance.getAdminThemes(limit, offset);
+		// the paging parameters are optional; without them every theme is returned
+		List<Map<String, Object>> themes = instance.getAdminThemes(limit == null ? -1 : limit,
+				offset == null ? 0 : offset);
 		return WebUtility.getResponse(themes, 200);
 	}
 
@@ -135,7 +140,9 @@ public class AdminThemeResource {
 		boolean isActive = Boolean.parseBoolean(form.getFirst("isActive"));
 		String themeId = instance.createAdminTheme(themeName, themeMap, isActive);
 		if (themeId != null) {
-			return WebUtility.getResponse(true, 200);
+			auditThemeChange(user, "create", themeId, themeName);
+			// a non-empty id is still truthy to callers that only test for success
+			return WebUtility.getResponse(themeId, 200);
 		} else {
 			return WebUtility.getResponse(false, 400);
 		}
@@ -174,6 +181,7 @@ public class AdminThemeResource {
 		boolean isActive = Boolean.parseBoolean(form.getFirst("isActive"));
 		boolean success = instance.editAdminTheme(themeId, themeName, themeMap, isActive);
 		if (success) {
+			auditThemeChange(user, "edit", themeId, themeName);
 			return WebUtility.getResponse(success, 200);
 		} else {
 			return WebUtility.getResponse(success, 400);
@@ -210,6 +218,7 @@ public class AdminThemeResource {
 		String themeId = WebUtility.inputSanitizer(form.getFirst("id"));
 		boolean success = instance.deleteAdminTheme(themeId);
 		if (success) {
+			auditThemeChange(user, "delete", themeId, null);
 			return WebUtility.getResponse(success, 200);
 		} else {
 			return WebUtility.getResponse(success, 400);
@@ -246,6 +255,7 @@ public class AdminThemeResource {
 		String themeId = WebUtility.inputSanitizer(form.getFirst("id"));
 		boolean success = instance.setActiveTheme(themeId);
 		if (success) {
+			auditThemeChange(user, "activate", themeId, null);
 			return WebUtility.getResponse(success, 200);
 		} else {
 			return WebUtility.getResponse(success, 400);
@@ -281,10 +291,20 @@ public class AdminThemeResource {
 
 		boolean success = instance.setAllThemesInactive();
 		if (success) {
+			auditThemeChange(user, "deactivate_all", null, null);
 			return WebUtility.getResponse(success, 200);
 		} else {
 			return WebUtility.getResponse(success, 400);
 		}
+	}
+
+	/**
+	 * Records an admin theme change; the theme itself is not logged, only which
+	 * theme changed and how
+	 */
+	private static void auditThemeChange(User user, String action, String themeId, String themeName) {
+		UserAuditTrailUtils.recordResourceEvent(user, AuditEventType.CONFIG_UPDATE, AuditTargetType.PLATFORM_CONFIG,
+				themeId, themeName, null, null, null, Map.of("setting", "admin_theme", "action", action));
 	}
 
 }
