@@ -51,6 +51,7 @@ import jakarta.ws.rs.core.Context;
 import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
 import prerna.auth.User;
+import prerna.auth.utils.SecurityProjectUtils;
 import prerna.reactor.playwright.PlaywrightUtility;
 import prerna.reactor.playwright.RecordingMeta;
 import prerna.reactor.playwright.StepsEnvelope;
@@ -268,6 +269,10 @@ public class RemoteBrowserSessionController {
 		if (req.name == null || req.name.isBlank()) {
 			return buildError(Response.Status.BAD_REQUEST, "Field 'name' is required");
 		}
+		// the recording is written into the project's folder, so the caller must be able to edit it
+		if (!SecurityProjectUtils.userCanEditProject(user, req.project)) {
+			return buildError(Response.Status.FORBIDDEN, "User does not have permission to edit this project");
+		}
 
 		try {
 			long now = System.currentTimeMillis();
@@ -298,7 +303,6 @@ public class RemoteBrowserSessionController {
 			}
 
 			Map<String, Object> response = new HashMap<>();
-			response.put("filePath", file.toAbsolutePath().toString());
 			response.put("fileName", file.getFileName().toString());
 			response.put("project", req.project);
 			response.put("saved", true);

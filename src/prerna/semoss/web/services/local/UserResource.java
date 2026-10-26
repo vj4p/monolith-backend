@@ -93,6 +93,7 @@ import prerna.usertracking.UserAuditTrailUtils;
 import prerna.usertracking.UserTrackingUtils;
 import prerna.util.Constants;
 import prerna.util.SocialPropertiesUtil;
+import prerna.util.SocialPropertySecrets;
 import prerna.util.Utility;
 import prerna.util.ldap.ILdapAuthenticator;
 import prerna.util.ldap.LDAPPasswordChangeRequiredException;
@@ -1716,13 +1717,14 @@ public class UserResource {
 			return WebUtility.getResponse(ret, 400);
 		}
 
+		// a session is required whether or not creation is restricted to admins
+		User user = (User) request.getSession().getAttribute(Constants.SESSION_USER);
+		if (user == null) {
+			Map<String, String> ret = new HashMap<>();
+			ret.put(Constants.ERROR_MESSAGE, "No active session. Please login");
+			return WebUtility.getResponse(ret, 401);
+		}
 		if (Utility.getApplicationAdminOnlyCreateAPIUser()) {
-			User user = (User) request.getSession().getAttribute(Constants.SESSION_USER);
-			if (user == null) {
-				Map<String, String> ret = new HashMap<>();
-				ret.put(Constants.ERROR_MESSAGE, "No active session. Please login as an admin");
-				return WebUtility.getResponse(ret, 401);
-			}
 			if (!SecurityAdminUtils.userIsAdmin(user)) {
 				Map<String, String> ret = new HashMap<>();
 				ret.put(Constants.ERROR_MESSAGE,
@@ -1733,6 +1735,9 @@ public class UserResource {
 
 		String name = WebUtility.inputSQLSanitizer(request.getParameter("name"));
 		Map<String, String> oneTimeDetails = SecurityAPIUserUtils.createAPIUser(name);
+		// only the client id is recorded, never the secret key
+		UserAuditTrailUtils.recordResourceEvent(user, AuditEventType.API_KEY_CREATE, AuditTargetType.API_KEY,
+				oneTimeDetails.get("clientId"), name, null, null, null, Map.of("kind", "service_account"));
 		return WebUtility.getResponse(oneTimeDetails, 200);
 	}
 
@@ -1790,7 +1795,8 @@ public class UserResource {
 				loginApps.put(type, new TreeMap<String, String>());
 			}
 
-			loginApps.get(type).put(type_key, socialData.getProperty(prop));
+			// secrets are never sent to the browser, only whether they are set
+			loginApps.get(type).put(type_key, SocialPropertySecrets.maskValue(prop, socialData.getProperty(prop)));
 		}
 
 		return WebUtility.getResponse(loginApps, 200);
@@ -1826,8 +1832,9 @@ public class UserResource {
 		}.getType());
 		Map<String, String> sanitizedMods = new HashMap<>();
 
-		for (String key : mods.keySet()) {
-			sanitizedMods.put(WebUtility.inputSanitizer(key), WebUtility.inputSanitizer(mods.get(key)));
+		// a secret sent back as the marker is unchanged, so it must not overwrite the stored value
+		for (Map.Entry<String, String> mod : SocialPropertySecrets.dropUnchanged(mods).entrySet()) {
+			sanitizedMods.put(WebUtility.inputSanitizer(mod.getKey()), WebUtility.inputSanitizer(mod.getValue()));
 		}
 
 		try {
@@ -1867,7 +1874,9 @@ public class UserResource {
 
 		String newSocialProperties = request.getParameter("socialProperties");
 		try {
-			socialData.updateAllProperties(newSocialProperties);
+			// the editor was given masked secrets, so put the stored ones back before replacing the file
+			socialData.updateAllProperties(
+					SocialPropertySecrets.restoreMarkedValues(newSocialProperties, socialData.getFileContents()));
 		} catch (Exception e) {
 			classLogger.error("Unexpected error in modifyAllLoginProperties", e);
 			Map<String, String> errorRet = new HashMap<>();
@@ -1900,7 +1909,7 @@ public class UserResource {
 		}
 
 		try {
-			String fileContent = socialData.getFileContents();
+			String fileContent = SocialPropertySecrets.maskFileContents(socialData.getFileContents());
 			Map<String, String> retMap = new HashMap<>();
 			retMap.put("content", fileContent);
 			return WebUtility.getResponse(retMap, 200);
