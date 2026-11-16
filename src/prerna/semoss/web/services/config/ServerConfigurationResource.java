@@ -39,6 +39,10 @@ import java.util.Map;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
+import io.swagger.v3.oas.annotations.Operation;
+import io.swagger.v3.oas.annotations.media.Content;
+import io.swagger.v3.oas.annotations.media.Schema;
+import io.swagger.v3.oas.annotations.responses.ApiResponse;
 import jakarta.annotation.security.PermitAll;
 import jakarta.servlet.FilterChain;
 import jakarta.servlet.http.HttpServletRequest;
@@ -225,14 +229,6 @@ public class ServerConfigurationResource {
 		}
 		loadConfig.put("defaultScriptingLanguage", defaultScriptingLanguage);
 
-		// local mode
-		boolean localMode = false;
-		String localModeStr = Utility.getDIHelperProperty(Constants.LOCAL_DEPLOYMENT);
-		if (localModeStr != null) {
-			localMode = Boolean.parseBoolean(localModeStr);
-		}
-		loadConfig.put("localDeployment", localMode);
-
 		// insights are cacheable by default
 		boolean cacheableOnByDefault = Utility.getApplicationCacheInsight();
 		loadConfig.put("cacheInsightByDefault", cacheableOnByDefault);
@@ -326,11 +322,6 @@ public class ServerConfigurationResource {
 		myConfiguration.put("auditLogEnabled", Utility.isAuditLogsDatabaseEnabled());
 		// current date
 		myConfiguration.put("systemDate", new SemossDate(Utility.getCurrentZonedDateTimeUTC()));
-		// do not keep this session
-		// if no user and it is new
-		if (user == null && (session.isNew() || request.isRequestedSessionIdValid())) {
-			session.invalidate();
-		}
 
 		return myConfiguration;
 	}
@@ -338,9 +329,12 @@ public class ServerConfigurationResource {
 	@GET
 	@Path("/")
 	@Produces("application/json")
+	@Operation(operationId = "config", summary = "Read the server configuration", description = "Returns platform settings, login providers and, when signed in, the session's logins.")
+	@ApiResponse(responseCode = "200", description = "The server configuration", content = @Content(mediaType = "application/json", schema = @Schema(implementation = ServerConfig.class)))
 	public Response getServerConfig(@Context HttpServletRequest request, @Context HttpServletResponse response,
 			@Context FilterChain filterChain) {
 		List<NewCookie> newCookies = new ArrayList<>();
+		Map<String, Object> config = getConfig(request);
 
 		try {
 			ResourceUtility.getUser(request);
@@ -349,10 +343,10 @@ public class ServerConfigurationResource {
 			// should happen every time this is called
 			// since FE only calls this method on browser startup
 			// clean up any invalid cookies on the browser
-			WebUtility.expireSessionCookies(request, newCookies);
+			WebUtility.dropSessionWithoutUser(request, newCookies);
 		}
 
-		return WebUtility.getResponseNoCache(getConfig(request), 200, newCookies.toArray(new NewCookie[] {}));
+		return WebUtility.getResponseNoCache(config, 200, newCookies.toArray(new NewCookie[] {}));
 	}
 
 	@GET
@@ -367,7 +361,7 @@ public class ServerConfigurationResource {
 	/**
 	 * Return every JAX-RS endpoint registered with this application as a flat JSON
 	 * list, sorted by path. Discovery is reflection-driven: we walk the resource
-	 * singletons, read each class's {@code @Path}, and for every method carrying an
+	 * classes, read each class's {@code @Path}, and for every method carrying an
 	 * HTTP-method annotation (anything meta-annotated with {@link HttpMethod}) we
 	 * emit verb, path, owning resource class, Java method name, and the
 	 * {@code @Consumes}/{@code @Produces} content types.
@@ -399,8 +393,7 @@ public class ServerConfigurationResource {
 
 		List<Map<String, Object>> endpoints = new ArrayList<>();
 
-		for (Object resource : application.getSingletons()) {
-			Class<?> cls = resource.getClass();
+		for (Class<?> cls : application.getClasses()) {
 			if (!includeAdminResources && cls.getSimpleName().startsWith("Admin")) {
 				continue;
 			}

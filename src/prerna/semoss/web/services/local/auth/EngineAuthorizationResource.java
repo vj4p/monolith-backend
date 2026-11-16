@@ -44,6 +44,7 @@ import jakarta.ws.rs.QueryParam;
 import jakarta.ws.rs.core.Context;
 import jakarta.ws.rs.core.MultivaluedMap;
 import jakarta.ws.rs.core.Response;
+import prerna.auth.AccessPermissionEnum;
 import prerna.auth.utils.AbstractSecurityUtils;
 import prerna.auth.utils.SecurityAdminUtils;
 import prerna.auth.utils.SecurityEngineUtils;
@@ -328,7 +329,8 @@ public class EngineAuthorizationResource {
 			if (AbstractSecurityUtils.adminOnlyEngineAddAccess(engineId) && !SecurityAdminUtils.userIsAdmin(user)) {
 				throw new IllegalAccessException(ADMINS_ONLY);
 			}
-			SecurityEngineUtils.addEngineUser(user, newUserId, engineId, permission, endDate,
+			String level = AccessPermissionEnum.require(permission);
+			SecurityEngineUtils.addEngineUser(user, newUserId, engineId, level, endDate,
 					SecurityModelUsageLimitUtils.readJson(usageLimit));
 			Map<String, Object> ret = new HashMap<>();
 			ret.put("success", true);
@@ -355,7 +357,8 @@ public class EngineAuthorizationResource {
 				throw new IllegalAccessException(ADMINS_ONLY);
 			}
 			// adding user permissions in bulk
-			List<Map<String, Object>> permission = new Gson().fromJson(form.getFirst("userpermissions"), List.class);
+			List<Map<String, Object>> permission = AccessPermissionEnum
+					.requireEach(new Gson().fromJson(form.getFirst("userpermissions"), List.class));
 			// users picked from the Microsoft directory may not be in the security db yet
 			if (MicrosoftGraphUserLookup.isEnabled()) {
 				MicrosoftGraphUserLookup.addMissingUsers(user, permission);
@@ -395,12 +398,13 @@ public class EngineAuthorizationResource {
 			if (AbstractSecurityUtils.adminOnlyEngineAddAccess(engineId) && !SecurityAdminUtils.userIsAdmin(user)) {
 				throw new IllegalAccessException(ADMINS_ONLY);
 			}
+			String level = AccessPermissionEnum.require(newPermission);
 			if (usageLimitSent) {
-				SecurityEngineUtils.editEngineUserPermission(user, existingUserId, existingUserType, engineId,
-						newPermission, endDate, SecurityModelUsageLimitUtils.readJson(usageLimit));
+				SecurityEngineUtils.editEngineUserPermission(user, existingUserId, existingUserType, engineId, level,
+						endDate, SecurityModelUsageLimitUtils.readJson(usageLimit));
 			} else {
-				SecurityEngineUtils.editEngineUserPermission(user, existingUserId, existingUserType, engineId,
-						newPermission, endDate);
+				SecurityEngineUtils.editEngineUserPermission(user, existingUserId, existingUserType, engineId, level,
+						endDate);
 			}
 			Map<String, Object> ret = new HashMap<>();
 			ret.put("success", true);
@@ -430,7 +434,7 @@ public class EngineAuthorizationResource {
 				throw new IllegalAccessException(ADMINS_ONLY);
 			}
 			List<Map<String, Object>> requests = new Gson().fromJson(form.getFirst("userpermissions"), List.class);
-			SecurityEngineUtils.editEngineUserPermissions(user, engineId, requests);
+			SecurityEngineUtils.editEngineUserPermissions(user, engineId, AccessPermissionEnum.requireEach(requests));
 			Map<String, Object> ret = new HashMap<>();
 			ret.put("success", true);
 			return ret;
@@ -490,6 +494,92 @@ public class EngineAuthorizationResource {
 	}
 
 	/**
+	 * Lists the apps an engine gives a permission to. An app's custom reactors use
+	 * the permission in place of the signed in user's own. Anyone who can view the
+	 * engine lists them.
+	 *
+	 * @param request  the request, whose session holds the user
+	 * @param engineId the engine
+	 * @return one entry for each app, with its id and name, its level and end date
+	 *         and, on a model, its App Limit; 403 for a user who cannot view the
+	 *         engine
+	 */
+	@GET
+	@Produces("application/json")
+	@Path("getEngineProjectPermissions")
+	public Response getEngineProjectPermissions(@Context HttpServletRequest request,
+			@QueryParam("engineId") String engineId) {
+		String id = WebUtility.inputSanitizer(engineId);
+		return ResourceUtility.respond(request, "list the apps engine " + id + " gives a permission to",
+				user -> SecurityEngineUtils.getEngineProjectPermissions(user, id));
+	}
+
+	/**
+	 * Gives an app a permission on an engine, or changes the one it has, so the
+	 * app's custom reactors can use the engine for people who have no access to
+	 * it. Only the engine's owners can. On a model the App Limit is sent as
+	 * {@code usageLimit} (JSON, empty for no limit defined); without it the app
+	 * keeps the limit it has.
+	 *
+	 * @param request the request, whose session holds the user
+	 * @param form    {@code engineId}, {@code projectId}, {@code permission}
+	 *                (READ_ONLY or EDIT), and optionally {@code endDate} and
+	 *                {@code usageLimit}
+	 * @return 200 when the permission is saved, 400 with the reason when it cannot
+	 *         be, and 403 for a user who is not an owner of the engine
+	 */
+	@POST
+	@Produces("application/json")
+	@Path("setEngineProjectPermission")
+	public Response setEngineProjectPermission(@Context HttpServletRequest request,
+			MultivaluedMap<String, String> form) {
+		String engineId = WebUtility.inputSanitizer(form.getFirst("engineId"));
+		String projectId = WebUtility.inputSanitizer(form.getFirst("projectId"));
+		String permission = WebUtility.inputSanitizer(form.getFirst("permission"));
+		String endDate = WebUtility.inputSanitizer(form.getFirst("endDate"));
+		boolean givesUsageLimit = form.containsKey(USAGE_LIMIT);
+		String usageLimit = form.getFirst(USAGE_LIMIT);
+		String action = "give app " + projectId + " " + permission + " access to engine " + engineId;
+		return ResourceUtility.respond(request, action, user -> {
+			String level = AccessPermissionEnum.require(permission);
+			if (givesUsageLimit) {
+				SecurityEngineUtils.setEngineProjectPermission(user, projectId, engineId, level, endDate,
+						SecurityModelUsageLimitUtils.readJson(usageLimit));
+			} else {
+				SecurityEngineUtils.setEngineProjectPermission(user, projectId, engineId, level, endDate);
+			}
+			Map<String, Object> ret = new HashMap<>();
+			ret.put("success", true);
+			return ret;
+		});
+	}
+
+	/**
+	 * Takes away the permission an engine gives an app. Only the engine's owners
+	 * can. On a model the app's App Limit goes with it.
+	 *
+	 * @param request the request, whose session holds the user
+	 * @param form    {@code engineId} and {@code projectId}
+	 * @return 200 when the permission is taken away, 400 with the reason when it
+	 *         cannot be, and 403 for a user who is not an owner of the engine
+	 */
+	@POST
+	@Produces("application/json")
+	@Path("removeEngineProjectPermission")
+	public Response removeEngineProjectPermission(@Context HttpServletRequest request,
+			MultivaluedMap<String, String> form) {
+		String engineId = WebUtility.inputSanitizer(form.getFirst("engineId"));
+		String projectId = WebUtility.inputSanitizer(form.getFirst("projectId"));
+		String action = "take away the access of app " + projectId + " to engine " + engineId;
+		return ResourceUtility.respond(request, action, user -> {
+			SecurityEngineUtils.removeEngineProjectPermission(user, projectId, engineId);
+			Map<String, Object> ret = new HashMap<>();
+			ret.put("success", true);
+			return ret;
+		});
+	}
+
+	/**
 	 * Set the engine as being global (read only) for the entire semoss instance
 	 * 
 	 * @param request
@@ -529,8 +619,9 @@ public class EngineAuthorizationResource {
 		boolean isDiscoverable = Boolean.parseBoolean(form.getFirst("discoverable"));
 		String action = "make engine " + engineId + (isDiscoverable ? " discoverable" : " not discoverable");
 		return ResourceUtility.respond(request, action, user -> {
-			if (AbstractSecurityUtils.adminOnlyEngineSetPublic(engineId) && !SecurityAdminUtils.userIsAdmin(user)) {
-				throw new IllegalAccessException("User session is invalid");
+			if (AbstractSecurityUtils.adminOnlyEngineSetDiscoverable(engineId)
+					&& !SecurityAdminUtils.userIsAdmin(user)) {
+				throw new IllegalAccessException(ADMINS_ONLY);
 			}
 			SecurityEngineUtils.setEngineDiscoverable(user, engineId, isDiscoverable);
 			Map<String, Object> ret = new HashMap<>();
@@ -625,6 +716,7 @@ public class EngineAuthorizationResource {
 			}
 			// adding user permissions and updating user access requests in bulk
 			List<Map<String, String>> requests = new Gson().fromJson(form.getFirst("requests"), List.class);
+			AccessPermissionEnum.requireEach(requests);
 			SecurityEngineUtils.approveEngineUserAccessRequests(user, engineId, requests, endDate);
 			Map<String, Object> ret = new HashMap<>();
 			ret.put("success", true);
