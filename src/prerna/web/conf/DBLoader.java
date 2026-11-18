@@ -46,6 +46,7 @@ import jakarta.servlet.ServletContext;
 import jakarta.servlet.ServletContextEvent;
 import jakarta.servlet.ServletContextListener;
 import jakarta.servlet.SessionCookieConfig;
+import prerna.auth.utils.ExpiredAccessRemoval;
 import prerna.cluster.util.ClusterUtil;
 import prerna.ds.node.NodeUtils;
 import prerna.engine.api.IDatabaseEngine;
@@ -66,7 +67,7 @@ import prerna.util.AbstractFileWatcher;
 import prerna.util.ChromeDriverUtility;
 import prerna.util.ChrootTemplate;
 import prerna.util.Constants;
-import prerna.util.DIHelper;
+import prerna.util.InternalUtility;
 import prerna.util.SystemEngineRegistry;
 import prerna.util.Utility;
 import prerna.util.insight.InsightUtility;
@@ -196,7 +197,7 @@ public class DBLoader implements ServletContextListener {
 
 		// Load RDF_Map.prop file
 		classLogger.log(STARTUP, "Loading RDF_Map.prop: {}", Utility.cleanLogString(rdfPropFile));
-		DIHelper.getInstance().loadCoreProp(rdfPropFile);
+		InternalUtility.loadCoreProp(rdfPropFile);
 
 		if (RserveUtil.R_KILL_ON_STARTUP) {
 			classLogger.log(STARTUP, "Killing existing RServes running on the machine");
@@ -210,15 +211,15 @@ public class DBLoader implements ServletContextListener {
 		// set security enabled within DIHelper first
 		// this is because security database, on init, will
 		// load it as a boolean instead of us searching within DIHelper
-		DIHelper.getInstance().setLocalProperty(Constants.ADMIN_SET_PUBLISHER, adminSetPublisher);
-		DIHelper.getInstance().setLocalProperty(Constants.ADMIN_SET_EXPORTER, adminSetExporter);
-		DIHelper.getInstance().setLocalProperty(Constants.USE_LOGOUT_PAGE, useLogoutPage);
-		DIHelper.getInstance().setLocalProperty(Constants.SESSION_ID_KEY, SESSION_ID_KEY);
-		DIHelper.getInstance().setLocalProperty(Constants.CONTEXT_PATH_KEY, contextPath);
+		InternalUtility.setLocalProperty(Constants.ADMIN_SET_PUBLISHER, adminSetPublisher);
+		InternalUtility.setLocalProperty(Constants.ADMIN_SET_EXPORTER, adminSetExporter);
+		InternalUtility.setLocalProperty(Constants.USE_LOGOUT_PAGE, useLogoutPage);
+		InternalUtility.setLocalProperty(Constants.SESSION_ID_KEY, SESSION_ID_KEY);
+		InternalUtility.setLocalProperty(Constants.CONTEXT_PATH_KEY, contextPath);
 
 		// Load empty engine list into DIHelper, then load engines from db folder
 		classLogger.log(STARTUP, "Loading engines...");
-		DIHelper.getInstance().setEngineProperty(Constants.ENGINES, "");
+		InternalUtility.setEngineIds("");
 		loadSmss(Constants.ENGINE_WEB_WATCHER);
 		// if there was an issue starting up the server
 		// we should do it here so that we can redirect the user
@@ -311,7 +312,7 @@ public class DBLoader implements ServletContextListener {
 		}
 
 		classLogger.log(STARTUP, "Loading projects...");
-		DIHelper.getInstance().setProjectProperty(Constants.PROJECTS, "");
+		InternalUtility.setProjectIds("");
 		loadSmss(Constants.PROJECT_WATCHER);
 
 		// Load and run triggerOnLoad jobs
@@ -321,6 +322,10 @@ public class DBLoader implements ServletContextListener {
 			} catch (Exception e) {
 				classLogger.warn("Failed to execute triggerOnLoad scheduler jobs", e);
 			}
+		}
+
+		if (SystemEngineRegistry.isSecurityDbLoaded()) {
+			ExpiredAccessRemoval.startSchedule();
 		}
 
 		// this will likely need to be broken out into another service in the future
@@ -359,7 +364,7 @@ public class DBLoader implements ServletContextListener {
 	private void loadSmss(String pathKey) {
 		Map<String, String> parentMDC = ThreadContext.getImmutableContext();
 
-		String pathValue = DIHelper.getInstance().getProperty(pathKey);
+		String pathValue = Utility.getDIHelperProperty(pathKey);
 		if (pathValue == null || pathValue.trim().isEmpty()) {
 			throw new NullPointerException("Error occurred - could not find " + pathKey
 					+ " in RDF_Map.prop which is required for starting the application");
@@ -441,7 +446,7 @@ public class DBLoader implements ServletContextListener {
 		List<String> eIds = MasterDatabaseUtility.getAllDatabaseIds();
 		for (String id : eIds) {
 			// grab only loaded engines
-			IEngine engine = (IEngine) DIHelper.getInstance().getEngineProperty(id);
+			IEngine engine = InternalUtility.getLoadedEngine(id);
 			if (engine != null) {
 				// if it is loaded, close it
 				classLogger.log(SHUTDOWN, "Closing engine {}", id);
